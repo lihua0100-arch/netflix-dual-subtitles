@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix 中英悬浮双字幕
 // @namespace    zhenghao.netflix.dualsubs
-// @version      1.2.0
+// @version      1.3.0
 // @updateURL    https://raw.githubusercontent.com/lihua0100-arch/netflix-dual-subtitles/main/netflix-dual-subtitles.user.js
 // @downloadURL  https://raw.githubusercontent.com/lihua0100-arch/netflix-dual-subtitles/main/netflix-dual-subtitles.user.js
 // @description  把 Netflix 英文字幕翻译成中文，中英悬浮双字幕；支持全屏和官方中文字幕。
@@ -12,7 +12,7 @@
 // @connect      nflxvideo.net
 // @connect      nflximg.net
 // @connect      netflix.com
-// @connect      api.fanyi.baidu.com
+// @connect      api.mymemory.translated.net
 // @sandbox      JavaScript
 // @noframes
 // @license      MIT
@@ -159,32 +159,7 @@
   const at = (cues,time) => [...new Set(activeCues(cues,time).map(c=>c.text))].join('\n');
 
   // Translate one cue at a time, with a bounded look-ahead queue and in-memory cache.
-  // This is Google's undocumented web interface, not the paid Cloud Translation API.
-  // There is no captcha bypass: rate limits suspend translation until retry/backoff.
-  // 百度通用翻译的签名使用 MD5（UTF-8 字节）。
-  function md5(input) {
-    const bytes = Array.from(new TextEncoder().encode(input));
-    const bits = bytes.length * 8;
-    bytes.push(128); while (bytes.length % 64 !== 56) bytes.push(0);
-    for (let i=0;i<8;i++) bytes.push(i<4 ? (bits >>> (8*i)) & 255 : Math.floor(bits / 4294967296) >>> (8*(i-4)) & 255);
-    const shifts=[7,12,17,22,5,9,14,20,4,11,16,23,6,10,15,21];
-    const k=Array.from({length:64},(_,i)=>Math.floor(Math.abs(Math.sin(i+1))*4294967296)>>>0);
-    let a0=0x67452301,b0=0xefcdab89,c0=0x98badcfe,d0=0x10325476;
-    for(let off=0;off<bytes.length;off+=64){
-      const m=Array.from({length:16},(_,i)=>(bytes[off+4*i]|bytes[off+4*i+1]<<8|bytes[off+4*i+2]<<16|bytes[off+4*i+3]<<24)>>>0);
-      let a=a0,b=b0,c=c0,d=d0;
-      for(let i=0;i<64;i++){
-        let f,g;if(i<16){f=(b&c)|(~b&d);g=i;}else if(i<32){f=(d&b)|(~d&c);g=(5*i+1)%16;}else if(i<48){f=b^c^d;g=(3*i+5)%16;}else{f=c^(b|~d);g=(7*i)%16;}
-        const n=(a+f+k[i]+m[g])>>>0,shift=shifts[(i>>4)*4+i%4];
-        a=d;d=c;c=b;b=(b+((n<<shift)|(n>>>(32-shift))))>>>0;
-      }
-      a0=(a0+a)>>>0;b0=(b0+b)>>>0;c0=(c0+c)>>>0;d0=(d0+d)>>>0;
-    }
-    return [a0,b0,c0,d0].map(n=>[0,8,16,24].map(x=>((n>>>x)&255).toString(16).padStart(2,'0')).join('')).join('');
-  }
-  const credentialsKey = 'zh-netflix-baidu-credentials-v1';
-  let credentials = {appid:'', secret:''};
-  try { Object.assign(credentials, JSON.parse(localStorage.getItem(credentialsKey) || '{}')); } catch (_) {}
+  // MyMemory anonymous translation has a daily quota; errors suspend retries after backoff.
   const translated = new Map();
   let translating = false, nextTranslationAt = 0, translationFailures = 0, translationEpoch = 0;
   let liveTranslationRequest = null, translationNote = '';
@@ -204,29 +179,27 @@
     if (wantsTranslation()) status('zh',message);
   }
   function translateOne(text,target) {
-    if (!credentials.appid || !credentials.secret) return Promise.reject(Error('请先填写百度 APP ID 和密钥'));
-    const salt = String(Date.now()) + String(Math.floor(Math.random()*1000000));
-    const sign = md5(credentials.appid + text + salt + credentials.secret);
-    const body = new URLSearchParams({q:text,from:'en',to:target==='zh-TW'?'cht':'zh',appid:credentials.appid,salt,sign}).toString();
+    if (new TextEncoder().encode(text).length > 500) return Promise.reject(Error('单句超过翻译服务的 500 字节限制'));
+    const query = new URLSearchParams({q:text,langpair:'en|'+(target==='zh-TW'?'zh-TW':'zh-CN')});
     return new Promise((resolve,reject)=>{
       let handle,settled=false;
       const finish=(error,value)=>{if(settled)return;settled=true;if(liveTranslationRequest===token)liveTranslationRequest=null;error?reject(error):resolve(value);};
       const token={cancel(){finish(Error('cancelled'));try{handle?.abort?.();}catch(_){}}};
       liveTranslationRequest=token;
-      handle=GM_xmlhttpRequest({method:'POST',url:'https://api.fanyi.baidu.com/api/trans/vip/translate',headers:{'Content-Type':'application/x-www-form-urlencoded'},data:body,anonymous:true,timeout:12000,
+      handle=GM_xmlhttpRequest({method:'GET',url:'https://api.mymemory.translated.net/get?'+query,anonymous:true,timeout:12000,
         onload:r=>{try{
           if(r.status<200||r.status>=300)throw Error('HTTP '+r.status);
-          if(r.finalUrl && new URL(r.finalUrl).hostname!=='api.fanyi.baidu.com')throw Error('请求被拦截');
+          if(r.finalUrl && new URL(r.finalUrl).hostname!=='api.mymemory.translated.net')throw Error('请求被拦截');
           const data=originalParse(r.responseText);
-          if(data.error_code)throw Error('百度错误 '+data.error_code+'：'+(data.error_msg||'请检查账号及配额'));
-          const result=Array.isArray(data.trans_result)?data.trans_result.map(x=>x.dst||'').join('\n').trim():'';
-          if(!result)throw Error('百度返回内容无效');finish(null,result);
-        }catch(error){finish(error);}},onerror:()=>finish(Error('百度网络错误')),ontimeout:()=>finish(Error('百度请求超时')),onabort:()=>finish(Error('cancelled'))});
+          if(data.quotaFinished || Number(data.responseStatus)===429)throw Error('免费翻译额度已用完，请稍后再试');
+          if(Number(data.responseStatus)!==200)throw Error('翻译服务错误 '+(data.responseStatus||'未知'));
+          const result=typeof data.responseData?.translatedText==='string'?data.responseData.translatedText.trim():'';
+          if(!result)throw Error('翻译服务返回内容为空');finish(null,result);
+        }catch(error){finish(error);}},onerror:()=>finish(Error('翻译服务网络错误')),ontimeout:()=>finish(Error('翻译请求超时')),onabort:()=>finish(Error('cancelled'))});
     });
   }
   async function pumpTranslation() {
     if (!wantsTranslation() || !video || translating || translationFailures >= 3) return;
-    if (!credentials.appid || !credentials.secret) { translationStatus('请填写百度 APP ID 和密钥'); return; }
     const now=Date.now();
     if (now < nextTranslationAt) return;
     const time=video.currentTime-cfg.delay;
@@ -255,7 +228,7 @@
   }
   function translatedAt(time) {
     return [...new Set(activeCues(state.en,time).map(c=>translated.get(cacheKey(c.text)) ||
-      (translationFailures ? '百度翻译暂不可用，请查看设置面板' : (!credentials.appid || !credentials.secret ? '请在设置中填写百度翻译凭据' : '正在翻译…'))))].join('\n');
+      (translationFailures ? '翻译暂不可用，请查看设置面板' : '正在翻译…')))].join('\n');
   }
   function safeURL(url) {
     try { const u = new URL(url); return u.protocol === 'https:' && /(^|\.)(nflxvideo\.net|nflximg\.net|netflix\.com)$/.test(u.hostname); } catch (_) { return false; }
@@ -365,10 +338,10 @@
       </style>
       <div id="subtitles" hidden aria-live="off"><div id="enLine" class="line" lang="en"></div><div id="zhLine" class="line" lang="zh"></div></div>
       <div id="tools"><button id="toggle" aria-expanded="false" aria-controls="panel">中 / EN</button><section id="panel" hidden>
-      <h2>中英悬浮双字幕 · 1.2</h2><div class="row"><label style="margin:0"><input id="enabled" type="checkbox"> 开启双字幕</label><button id="close" class="small">收起</button></div>
+      <h2>中英悬浮双字幕 · 1.3</h2><div class="row"><label style="margin:0"><input id="enabled" type="checkbox"> 开启双字幕</label><button id="close" class="small">收起</button></div>
       <label for="enTrack">英文字幕</label><select id="enTrack"></select><div class="row"><span class="hint" id="enStatus"></span><button class="small" id="enImport">导入</button></div>
-      <label for="zhMode">中文来源</label><select id="zhMode"><option value="translate">英文 → 中文（百度翻译）</option><option value="auto">优先官方中文，没有则机器翻译</option><option value="official">只用官方 / 本地中文字幕</option></select><p class="hint">机器翻译会把英文字幕发送给百度。需开通百度通用文本翻译 API 并填写凭据。</p>
-      <label for="baiduApp">百度翻译 APP ID</label><input id="baiduApp" type="text" autocomplete="off" style="width:100%;background:#30303a;color:#fff"><label for="baiduSecret">百度翻译密钥</label><input id="baiduSecret" type="password" autocomplete="off" style="width:100%;background:#30303a;color:#fff"><button id="saveBaidu" class="small" style="margin-top:8px">保存百度凭据并重试</button><p class="hint">凭据保存在此浏览器的 Netflix 网站本地存储中，请勿分享给他人。</p><label for="zhTrack">官方中文字幕（可选）</label><select id="zhTrack"></select><div class="row"><span class="hint" id="zhStatus"></span><button class="small" id="zhImport">导入</button></div>
+      <label for="zhMode">中文来源</label><select id="zhMode"><option value="translate">英文 → 中文（免密钥翻译）</option><option value="auto">优先官方中文，没有则机器翻译</option><option value="official">只用官方 / 本地中文字幕</option></select><p class="hint">机器翻译会把英文字幕发送给 MyMemory，无需密钥；免费额度有限。</p>
+      <label for="zhTrack">官方中文字幕（可选）</label><select id="zhTrack"></select><div class="row"><span class="hint" id="zhStatus"></span><button class="small" id="zhImport">导入</button></div>
       <label for="zhPref">中文优先</label><select id="zhPref"><option value="hans">简体中文</option><option value="hant">繁體中文</option></select>
       <label for="enSize">英文字号 <output id="enSizeVal"></output></label><input id="enSize" type="range" min="16" max="60">
       <label for="zhSize">中文字号 <output id="zhSizeVal"></output></label><input id="zhSize" type="range" min="16" max="60">
@@ -376,7 +349,7 @@
       <label for="bg">背景深度 <output id="bgVal"></output></label><input id="bg" type="range" min="0" max="1" step="0.05">
       <label for="delay">字幕延迟（秒，正数表示晚显示）</label><input id="delay" type="number" min="-20" max="20" step="0.1">
       <div class="row" style="margin-top:15px"><button id="retry" class="small">重新读取</button><button id="reload" class="small">刷新播放页</button><button id="reset" class="small">重置样式</button></div>
-      <button id="retryTranslation" class="small" style="margin-top:12px">重试翻译</button><p class="hint">英文在上、中文译文在下，均悬浮在画面内。全屏请使用 Netflix 播放器的全屏按钮。也可导入本地 SRT / VTT / TTML 字幕；切集后需重新导入。</p><footer>开启机器翻译时，官方或导入的英文字幕会发给百度；导入的中文字幕不上传。</footer>
+      <button id="retryTranslation" class="small" style="margin-top:12px">重试翻译</button><p class="hint">英文在上、中文译文在下，均悬浮在画面内。全屏请使用 Netflix 播放器的全屏按钮。也可导入本地 SRT / VTT / TTML 字幕；切集后需重新导入。</p><footer>开启机器翻译时，官方或导入的英文字幕会发给 MyMemory；导入的中文字幕不上传。</footer>
       <input id="file" type="file" accept=".srt,.vtt,.xml,.ttml,.dfxp" hidden>
       </section></div>`;
     document.documentElement.appendChild(host);
@@ -394,13 +367,6 @@
     root.getElementById('zhMode').onchange = e => {
       cfg.zhMode=e.target.value;state.local.zh=false;cancelTranslation();save();
       if(!state.local.zh){if(cfg.zhMode==='translate'){state.zhGen++;state.zh=[];state.zhPending=false;status('zh','机器翻译 · 等待翻译');}else loadTrack('zh',fillOptions('zh'));}
-    };
-    root.getElementById('baiduApp').value=credentials.appid;
-    root.getElementById('baiduSecret').value=credentials.secret;
-    root.getElementById('saveBaidu').onclick=()=>{
-      credentials={appid:root.getElementById('baiduApp').value.trim(),secret:root.getElementById('baiduSecret').value.trim()};
-      try{localStorage.setItem(credentialsKey,originalStringify(credentials));}catch(_){status('zh','凭据保存失败，请检查浏览器存储');return;}
-      cancelTranslation();translated.clear();status('zh','凭据已保存，正在重试');pumpTranslation();
     };
     root.getElementById('retryTranslation').onclick = () => {cancelTranslation();status('zh','正在重试机器翻译…');pumpTranslation();};
     root.getElementById('zhPref').onchange = e => { cfg.zhPref=e.target.value;cancelTranslation();save();if(cfg.zhMode!=='translate'&&!state.local.zh) loadTrack('zh',fillOptions('zh')); };
